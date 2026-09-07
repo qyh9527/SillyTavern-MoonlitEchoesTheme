@@ -153,6 +153,8 @@ export function initAvatarInjector() {
  */
 export function initFormSheldHeightMonitor() {
     let isInitialized = false;
+    let lastHeight = 0;
+    let rafId = 0;
 
     function getAccurateHeight(element) {
         if (!element) return 0;
@@ -160,52 +162,65 @@ export function initFormSheldHeightMonitor() {
         return rect.height;
     }
 
+    // A `--formSheldHeight: ... !important` rule (e.g. the user's rawCustomCss
+    // freeze) means our writes never win anyway — skip the write to avoid the
+    // "JS writes -> CSS !important overrides" tug-of-war.
+    function isFrozen() {
+        const inline = document.documentElement.style.getPropertyPriority('--formSheldHeight');
+        return inline === 'important';
+    }
+
     function updateFormSheldHeight() {
         const formSheld = document.getElementById('form_sheld');
-        if (formSheld) {
-            const height = getAccurateHeight(formSheld);
-            if (height > 0) {
+        if (!formSheld) return;
+
+        const height = getAccurateHeight(formSheld);
+        // Dirty-check: skip the style write (and the forced sync layout it triggers)
+        // when the height hasn't actually changed.
+        if (height > 0 && height !== lastHeight) {
+            lastHeight = height;
+            if (!isFrozen()) {
                 document.documentElement.style.setProperty('--formSheldHeight', `${height}px`);
-                isInitialized = true;
             }
+            isInitialized = true;
         }
     }
 
+    // Coalesce every "measure now" request into a single rAF so that a burst of
+    // resize/observer callbacks in the same frame measures at most once.
+    function requestHeightUpdate() {
+        if (rafId) return;
+        rafId = requestAnimationFrame(() => {
+            rafId = 0;
+            updateFormSheldHeight();
+        });
+    }
+
+    // The ResizeObserver covers every real height change (QR bar add/remove,
+    // font-size hot-update, orientation, host re-layout). The MutationObserver
+    // is only kept as a fallback for the case where #form_sheld itself is
+    // removed/re-created. Neither touches #chat, so TT's per-message DOM
+    // virtualization is never disturbed.
     const mutationObserver = new MutationObserver((mutations) => {
-        let shouldUpdate = false;
-
         for (const mutation of mutations) {
-            if (mutation.target.id === 'form_sheld' || mutation.target.closest?.('#form_sheld')) {
-                shouldUpdate = true;
-                break;
-            }
-
             if (mutation.addedNodes.length) {
                 for (const node of mutation.addedNodes) {
                     if (
                         node.id === 'form_sheld' ||
                         (node.nodeType === 1 && node.querySelector && node.querySelector('#form_sheld'))
                     ) {
-                        shouldUpdate = true;
-                        break;
+                        setTimeout(startObservers, 50);
+                        return;
                     }
                 }
             }
-        }
-
-        if (shouldUpdate) {
-            setTimeout(updateFormSheldHeight, 0);
         }
     });
 
     const resizeObserver = new ResizeObserver((entries) => {
         for (const entry of entries) {
             if (entry.target.id === 'form_sheld') {
-                const { height } = entry.contentRect;
-                if (height > 0) {
-                    document.documentElement.style.setProperty('--formSheldHeight', `${height}px`);
-                    isInitialized = true;
-                }
+                requestHeightUpdate();
             }
         }
     });
@@ -221,113 +236,74 @@ export function initFormSheldHeightMonitor() {
         const formSheld = document.getElementById('form_sheld');
         if (formSheld) {
             resizeObserver.observe(formSheld);
-            mutationObserver.observe(formSheld, {
-                childList: true,
-                subtree: true,
-                attributes: true,
-                characterData: true,
-            });
 
             const parent = formSheld.parentElement;
             if (parent) {
                 mutationObserver.observe(parent, {
+                    childList: true,
                     attributes: true,
                     attributeFilter: ['style', 'class'],
                 });
             }
 
-            updateFormSheldHeight();
+            requestHeightUpdate();
         }
     }
 
+    // Body-level observer kept only to re-attach everything if #form_sheld is
+    // ever torn out of the DOM and re-inserted by the host app.
     const bodyObserver = new MutationObserver((mutations) => {
         for (const mutation of mutations) {
-            if (mutation.addedNodes.length) {
-                for (const node of mutation.addedNodes) {
-                    if (
-                        node.id === 'form_sheld' ||
-                        (node.nodeType === 1 && node.querySelector && node.querySelector('#form_sheld'))
-                    ) {
-                        setTimeout(startObservers, 50);
-                        return;
-                    }
+            if (!mutation.addedNodes.length) continue;
+            for (const node of mutation.addedNodes) {
+                if (
+                    node.id === 'form_sheld' ||
+                    (node.nodeType === 1 && node.querySelector && node.querySelector('#form_sheld'))
+                ) {
+                    setTimeout(startObservers, 50);
+                    return;
                 }
             }
         }
 
-        const formSheld = document.getElementById('form_sheld');
-        if (formSheld && !isInitialized) {
+        if (!isInitialized && document.getElementById('form_sheld')) {
             setTimeout(startObservers, 50);
         }
     });
 
-    function onTextAreaInput() {
-        updateFormSheldHeight();
-        setTimeout(updateFormSheldHeight, 10);
-        setTimeout(updateFormSheldHeight, 100);
-    }
-
-    function setupTextAreaListener() {
-        const textArea = document.getElementById('send_textarea');
-        if (textArea) {
-            textArea.removeEventListener('input', onTextAreaInput);
-            textArea.addEventListener('input', onTextAreaInput);
-        }
-    }
-
-    window.addEventListener('resize', updateFormSheldHeight);
+    window.addEventListener('resize', requestHeightUpdate);
     window.addEventListener('orientationchange', () => {
-        updateFormSheldHeight();
-        setTimeout(updateFormSheldHeight, 100);
-        setTimeout(updateFormSheldHeight, 500);
+        requestHeightUpdate();
+        setTimeout(requestHeightUpdate, 300);
     });
 
-    document.addEventListener('DOMContentLoaded', () => {
+    let booted = false;
+    function boot() {
+        if (booted) return;
+        booted = true;
+
+        // Deliberately no per-keystroke `input` listener and no QR/options click
+        // listeners: the user's textarea height is CSS-fixed, and any change that
+        // could move #form_sheld (QR bar, options drawer, font hot-update) already
+        // surfaces through ResizeObserver / window resize. Skipping them removes
+        // pure no-op forced layouts.
         startObservers();
-        setupTextAreaListener();
-        updateFormSheldHeight();
-        setTimeout(updateFormSheldHeight, 100);
-        setTimeout(updateFormSheldHeight, 500);
-        setTimeout(updateFormSheldHeight, 1000);
-    });
+        requestHeightUpdate();
 
-    window.addEventListener('load', () => {
-        startObservers();
-        setupTextAreaListener();
-        updateFormSheldHeight();
-        setTimeout(updateFormSheldHeight, 500);
-    });
-
-    function setupUIListeners() {
-        document.querySelectorAll('#qr--bar .qr--option').forEach((button) => {
-            button.addEventListener('click', () => {
-                setTimeout(updateFormSheldHeight, 10);
-                setTimeout(updateFormSheldHeight, 100);
-            });
+        bodyObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
         });
-
-        const optionsButton = document.getElementById('options_button');
-        if (optionsButton) {
-            optionsButton.addEventListener('click', () => {
-                setTimeout(updateFormSheldHeight, 10);
-                setTimeout(updateFormSheldHeight, 100);
-            });
-        }
     }
 
-    setTimeout(setupUIListeners, 1000);
-
-    bodyObserver.observe(document.body, {
-        childList: true,
-        subtree: true,
-    });
-
-    startObservers();
-    setupTextAreaListener();
-    updateFormSheldHeight();
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot, { once: true });
+    } else {
+        boot();
+    }
 
     return {
-        update: updateFormSheldHeight,
+        update: requestHeightUpdate,
         start: startObservers,
         stop: stopObservers,
     };
